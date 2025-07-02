@@ -71,19 +71,47 @@ def is_distributed():
 pass
 
 
-def distributed_function(n = 1, function = None, *args, **kwargs):
+def distributed_function(n=1, function=None, *args, **kwargs):
     if torch.distributed.is_initialized():
-        if torch.distributed.get_rank() == 0:
-            object_list = function(*args, **kwargs)
-            if n == 1: object_list = [object_list]
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+
+        # Debug: sync and log `n` across all ranks
+        n_tensor = torch.tensor([n], device="cuda" if torch.cuda.is_available() else "cpu")
+        torch.distributed.broadcast(n_tensor, src=0)
+        n = n_tensor.item()
+
+        if rank == 0:
+            result = function(*args, **kwargs)
+
+            if not isinstance(result, (list, tuple)):
+                object_list = [result] * n
+            else:
+                object_list = list(result)
+                if len(object_list) != n:
+                    raise ValueError(f"[Rank 0] Expected {n} elements, but got {len(object_list)}: {result}")
         else:
             object_list = [None for _ in range(n)]
-        # broadcast_object_list auto blocks so no need for barrier
-        torch.distributed.broadcast_object_list(object_list, src = 0, device = "cpu")
-        if n == 1: result = object_list[0]
+
+        print(f"[Rank {rank}] Broadcasting object_list (len={len(object_list)}): {object_list}")
+
+        torch.distributed.broadcast_object_list(
+            object_list,
+            src=0,
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        return object_list if n != 1 else object_list[0]
+
     else:
         result = function(*args, **kwargs)
-    return result
+        if n == 1:
+            return result
+        if isinstance(result, (list, tuple)) and len(result) == n:
+            return list(result)
+        else:
+            raise ValueError(f"[Non-distributed] Expected {n} elements, but got: {result}")
+
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
