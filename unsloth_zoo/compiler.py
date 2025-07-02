@@ -1175,13 +1175,13 @@ def patch_gradient_checkpointing(module, source):
     if "_gradient_checkpointing_func" in forward: return None
 
     # No gradient checkpointing?
-    modulelist_items = re.findall(r"(self\.[^\s]{1,}) = .*?nn\.ModuleList\(", init)
+    modulelist_items = re.findall(r"(self\.[^ ]{1,}) = .*?nn\.ModuleList\(", init)
     if len(modulelist_items) != 1: return None
     modulelist_item = modulelist_items[0]
 
     # Check in forward source
     finder = \
-        r"for ([^\s]{1,}) in " + modulelist_item + "\:[\n]" + \
+        r"for ([^\s]{1,}) in " + modulelist_item + r"\:[\n]" + \
         r"([\s]{4,})hidden_states = \1\(([^\)]{1,})\)"
     find = re.findall(finder, forward)
     if len(find) == 0:
@@ -1429,13 +1429,13 @@ def patch_gradient_accumulation(modeling_file, module):
 
         total_has_kwargs = True
         print(f"Unsloth: Patching {inner_class.__name__} within {module.__name__} to fix gradient accumulation.")
-        regex_find = f"{call_class}\(([^\)]{{1,}})\)"
+        regex_find = f"{call_class}\\(([^\\)]{{1,}}\\))"
         source = re.sub(regex_find, rf"{call_class}(\1, **kwargs)", source, flags = re.DOTALL | re.MULTILINE)
     pass
 
     if total_has_kwargs:
         # Fix **kwargs for function def
-        regex_find = "def forward\(([^\)]{1,})\)"
+        regex_find = "def forward\\(([^\\)]{1,})\\)"
         source = re.sub(regex_find, r"def forward(\1, **kwargs)", source, flags = re.DOTALL | re.MULTILINE)
 
         # Remove double commas
@@ -1684,7 +1684,7 @@ def unsloth_compile_transformers(
     torch_modules = re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)
     # Also get class LlamaSdpaAttention(LlamaAttention)
     inherited_class = "(?:" + "|".join(re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)) + ")"
-    inherited_modules = re.findall(r"class ([^\s]{1,})\(" + inherited_class + "\)", full_source)
+    inherited_modules = re.findall(r"class ([^\s]{1,})\\(" + inherited_class + r"\\)", full_source)
     # OrderedSet
     torch_modules = list(dict.fromkeys(torch_modules + inherited_modules))
     # Get all functions as well
@@ -1738,7 +1738,7 @@ def unsloth_compile_transformers(
         # Start of text
         defined = re.findall(r"\bdef[\s]{1,}" + re.escape(function),full_source, flags = re.DOTALL)
         # Disable self.
-        called = re.findall(r"[\s]{1,}" + re.escape(function) + "\(.+?\)", full_source, flags = re.DOTALL)
+        called = re.findall(r"[\s]{1,}" + re.escape(function) + r"\\(.+?\\)", full_source, flags = re.DOTALL)
         if len(defined) != 0 and len(called) != 0:
             called_functions.append(function)
     pass
