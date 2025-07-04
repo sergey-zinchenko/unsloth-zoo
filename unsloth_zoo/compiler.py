@@ -55,10 +55,10 @@ global COMBINED_UNSLOTH_NAME
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
 
 global UNSLOTH_COMPILE_LOCATION
-UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
+UNSLOTH_COMPILE_LOCATION = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
 
 global UNSLOTH_COMPILE_USE_TEMP
-UNSLOTH_COMPILE_USE_TEMP = False
+UNSLOTH_COMPILE_USE_TEMP = os.environ.get("UNSLOTH_COMPILE_USE_TEMP", "0") == "1"
 
 # Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
