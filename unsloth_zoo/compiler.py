@@ -21,7 +21,7 @@ __all__ = [
     "create_new_function",
 ]
 
-from typing import List, Dict, Tuple, Optional, Any, Callable
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import inspect
 import re
 import importlib
@@ -35,6 +35,7 @@ import time
 import logging
 import tempfile
 import sys
+import textwrap
 from .utils import (
     Version,
     is_main_process,
@@ -93,6 +94,9 @@ DISABLED_KEYWORDS = [
     "select_best_resolution", # Llava NeXT errors out
     "original_aspect_ratio > current_aspect_ratio",  # Llava NeXT errors out
     "causal_mask[start:end, start:end] = 0", # Pixtral Dynamic slicing on data-dependent value is not supported
+    "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", # Gemma3 create_masks_for_generate
+    "create_causal_mask(**mask_kwargs)", # Gemma3 create_masks_for_generate
+    "compute_mup_vector", # used in falcon h1 init and not needed to compile + inductor complains
 ]
 
 _license_header = """
@@ -113,23 +117,37 @@ _license_header = """
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
+import torch
 import importlib.util
 if importlib.util.find_spec("unsloth_studio") is None:
     UNSLOTH_STUDIO_ENABLED = False
 else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
-from typing import List, Dict, Tuple, Optional, Any, Callable
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import math
+
+UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+
+import logging
+logger_compiler = logging.getLogger(__name__)
+if UNSLOTH_ENABLE_LOGGING:
+    logger_compiler.setLevel(logging.DEBUG)
+
+global INFERENCE_RUNS
+INFERENCE_RUNS = 0
+
+import torch._dynamo.eval_frame as torch_dynamo_eval_frame
+torch_compiler_set_stance = torch.compiler.set_stance
+
 """
 
 _disabled_sdpa_code = f"""{_license_header}
 
-import os
-import torch
 from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
-    compiled_ce_loss_function,
+    unsloth_compiled_ce_loss_function,
+    unsloth_compiled_fused_ce_loss_function,
 )
 
 if UNSLOTH_STUDIO_ENABLED:
@@ -307,6 +325,17 @@ def get_compile_folder(use_tempfile = False):
     return location, UNSLOTH_COMPILE_USE_TEMP
 pass
 
+# Mask creation functions
+@functools.lru_cache(1)
+def get_mask_functions():
+    try:
+        import transformers.masking_utils
+        masking_utils = dir(transformers.masking_utils)
+        return [x for x in masking_utils if x.startswith("create")]
+    except:
+        return []
+pass
+
 def create_new_function(
     name,
     new_source,
@@ -337,11 +366,17 @@ def create_new_function(
     items = [x for x in functions if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source: items += ["SiglipEncoder"]
-
+    # Check for create_causal_mask, create_masks_for_generate, create_sliding_window_causal_mask
+    mask_functions = get_mask_functions()
+    for mask_function in mask_functions:
+        if mask_function in new_source: items += [mask_function]
+    pass
+    # Full import script
     imports = "from torch import Tensor\n"
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
+    imports += "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     imports += f"from {model_location} import (" + ", ".join(x for x in items) + ")" if len(items) != 0 else ""
     new_source = imports + "\n\n" + new_source
     new_source = prepend + new_source + append
@@ -387,6 +422,8 @@ def create_new_function(
                 if versioning[:versioning.find('__UNSLOTH_VERSIONING__')] != versions:
                     overwrite = True
     pass
+    if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
+        overwrite = False
 
     # Check location
     def write_file(function_location, write_new_source):
@@ -502,6 +539,10 @@ def create_standalone_class(
     source = source.split("\n")
     source = "\n".join(x[spaces:] for x in source)
 
+    # For cuda_kernels_forward, we disable
+    if "cuda_kernels_forward" in source:
+        disable = True
+
     if disable is not None:
         compile = \
             f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)" \
@@ -553,6 +594,14 @@ def create_standalone_class(
 
     # Fix Gemma 3 ignore_index being not set!
     source = source.replace("self.config.ignore_index", "-100")
+
+    # Force embeddings with offsets to clamp_(0, max_size)
+    # This fixes some weird OOBs accesses for Gemma 3N for example
+    source = re.sub(
+        r"self\.([A-Za-z\_]{0,}embedding)\(input_ids (\-|\+) (self\.[A-Za-z\_]{1,})\)",
+        r"self.\1((input_ids \2 \3).clamp_(0))",
+        source,
+    )
     return source
 pass
 
@@ -616,6 +665,35 @@ pass
 
 """
 
+__DYNAMO__RECOMPILING__ = """
+
+    # Set compiler stance to fail on recompiles for inference
+    global INFERENCE_RUNS
+    old_stance = torch_dynamo_eval_frame._stance.stance
+    if INFERENCE_RUNS == 1:
+        # Skip guards and return to eager -> we still need guards!
+        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger_compiler.info(
+                f"Unsloth: Removing compiler guards after 1 inference run. "\\
+                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+            )
+    elif old_stance == "eager_on_recompile":
+        pass
+    elif old_stance == "default" and INFERENCE_RUNS > 1:
+        # Reset compiler stance
+        torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger_compiler.info(
+                f"Unsloth: Reseting guards. "\\
+                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+            )
+        INFERENCE_RUNS = 0
+    INFERENCE_RUNS += 1
+"""
+
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -664,6 +742,7 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
+    __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
     loss = fast_linear_cross_entropy(
@@ -684,11 +763,17 @@ elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
 else:
-    logits = self.lm_head(hidden_states\\1)
-    torch._dynamo.mark_dynamic(logits, 1)
+    lm_head_weight = self.lm_head.weight
+    lm_head_bias   = getattr(self.lm_head, "bias", None)
+
+    # ========= NEW fused =========
+    _hidden_states = hidden_states\\1
+    torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = compiled_ce_loss_function(
-        output_logits        = logits,
+    loss = unsloth_compiled_fused_ce_loss_function(
+        hidden_states        = _hidden_states,
+        lm_head_weight       = lm_head_weight,
+        lm_head_bias         = lm_head_bias,
         output_labels        = labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
@@ -697,6 +782,23 @@ else:
         n_items              = n_items if n_items is not None else 0,
         requires_grad_       = requires_grad_,
     )
+
+    # ========= OLD non fused =========
+    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
+    # torch._dynamo.mark_dynamic(logits, 1)
+    # torch._dynamo.mark_dynamic(labels, 1)
+    # loss = unsloth_compiled_ce_loss_function(
+    #     output_logits        = logits,
+    #     output_labels        = labels,
+    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
+    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
+    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
+    #     vocab_size           = (\\6),
+    #     n_items              = n_items if n_items is not None else 0,
+    #     requires_grad_       = requires_grad_,
+    # )
+
+
     # if (\\2) != ():
     #     logits = logits * (\\2)
     # if (\\3) != ():
@@ -714,7 +816,7 @@ else:
     # shift_labels = shift_labels.to(shift_logits.device)
     # loss = loss_fct(shift_logits, shift_labels)
     # if n_items is not None: loss = loss / n_items
-"""
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_2 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -756,6 +858,7 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
+    __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
 elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
     loss = fast_linear_cross_entropy(
@@ -776,11 +879,17 @@ elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
 elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:
-    logits = self.lm_head(hidden_states\\1)
-    torch._dynamo.mark_dynamic(logits, 1)
+    lm_head_weight = self.lm_head.weight
+    lm_head_bias   = getattr(self.lm_head, "bias", None)
+
+    # ========= NEW fused =========
+    _hidden_states = hidden_states\\1
+    torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = compiled_ce_loss_function(
-        output_logits        = logits,
+    loss = unsloth_compiled_fused_ce_loss_function(
+        hidden_states        = _hidden_states,
+        lm_head_weight       = lm_head_weight,
+        lm_head_bias         = lm_head_bias,
         output_labels        = labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
@@ -789,6 +898,22 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
         n_items              = n_items if n_items is not None else 0,
         requires_grad_       = requires_grad_,
     )
+
+
+    # ========= OLD non fused =========
+    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
+    # torch._dynamo.mark_dynamic(logits, 1)
+    # torch._dynamo.mark_dynamic(labels, 1)
+    # loss = unsloth_compiled_ce_loss_function(
+    #     output_logits        = logits,
+    #     output_labels        = labels,
+    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
+    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
+    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
+    #     vocab_size           = (\\8),
+    #     n_items              = n_items if n_items is not None else 0,
+    #     requires_grad_       = requires_grad_,
+    # )
 else:
     logits = self.lm_head(hidden_states\\1)
     if (\\2) != ():
@@ -800,7 +925,7 @@ else:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
     loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
-"""
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_3 = """
 $OUTPUTLOGITS$
@@ -849,15 +974,22 @@ requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
+    __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
 else:
-    logits = self.lm_head(hidden_states\\1)
-    torch._dynamo.mark_dynamic(logits, 1)
+    lm_head_weight = self.lm_head.weight
+    lm_head_bias   = getattr(self.lm_head, "bias", None)
+
+    # ========= NEW fused =========
+    _hidden_states = hidden_states\\1
+    torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
-    loss = compiled_ce_loss_function(
-        output_logits        = logits,
+    loss = unsloth_compiled_fused_ce_loss_function(
+        hidden_states        = _hidden_states,
+        lm_head_weight       = lm_head_weight,
+        lm_head_bias         = lm_head_bias,
         output_labels        = labels,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
@@ -867,7 +999,25 @@ else:
         mask                 = \\6,
         requires_grad_       = requires_grad_,
     )
-"""
+
+    # ========= OLD non fused =========
+    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
+    # torch._dynamo.mark_dynamic(logits, 1)
+    # torch._dynamo.mark_dynamic(labels, 1)
+    # if attention_mask is not None:
+    #     torch._dynamo.mark_dynamic(attention_mask, 1)
+    # loss = unsloth_compiled_ce_loss_function(
+    #     output_logits        = logits,
+    #     output_labels        = labels,
+    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
+    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
+    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
+    #     vocab_size           = (\\7),
+    #     n_items              = n_items if n_items is not None else 0,
+    #     mask                 = \\6,
+    #     requires_grad_       = requires_grad_,
+    # )
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 ce_finders = [
     (cross_entropy_find_1, cross_entropy_replacement_1,),
@@ -1115,8 +1265,8 @@ def apply_mask_attention_mask_out(source):
     if not len(re.findall(r"labels[\s]{0,}\=labels[\s]{0,}\,\n", source)): return source
     if "ForConditionalGeneration" in source:
         source = re.sub(
-            r"attention_mask[\s]{0,}\=attention_mask[\s]{0,}\,\n",
-            "attention_mask=mask_attention_mask_out(labels = labels, attention_mask = attention_mask),\n",
+            r"labels[\s]{0,}\=labels[\s]{0,}\,\n",
+            "labels=mask_attention_mask_out(labels = labels, attention_mask = attention_mask),\n",
             source,
         )
     return source
@@ -1156,6 +1306,42 @@ def convert_attention_masks_to_bool(module, old_source):
 pass
 
 
+# We need to manually replace some items
+# For example HF 4.53.1 breaks Qwen2VL since None wasn't provided
+custom_gradient_checkpointing_replacements = [
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb=rotary_pos_emb,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )""",
+    ),
+    (
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
+            )""",
+        """hidden_states = blk(
+                hidden_states,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb=rotary_pos_emb,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                **kwargs,
+            )""",
+    )
+]
 replace_gradient_checkpointing = """
 for LAYER in MODULELIST_ITEM:
 $if self.gradient_checkpointing and self.training:
@@ -1173,6 +1359,11 @@ def patch_gradient_checkpointing(module, source):
     try: forward = inspect.getsource(source.forward)
     except: return None
     if "_gradient_checkpointing_func" in forward: return None
+
+    # Fix Qwen2 missing None for gradient checkpointing
+    for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
+        forward = forward.replace(custom_find, custom_replace)
+    pass
 
     # No gradient checkpointing?
     modulelist_items = re.findall(r"(self\.[^ ]{1,}) = .*?nn\.ModuleList\(", init)
@@ -1207,6 +1398,44 @@ def patch_gradient_checkpointing(module, source):
     return init, forward
 pass
 
+DTYPE_MISMATCH_FIND = """
+attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+"""
+
+DTYPE_MISMATCH_REPLACE = """
+if attention_mask_tensor.dtype == torch.bool:
+    attention_mask_tensor = attention_mask_tensor.int()
+elif torch.is_floating_point(attention_mask_tensor):
+    attention_mask_tensor = attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
+    attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+"""
+
+def patch_finfo_attention_mask_dtype_mismatch(module, source):
+    try:
+        old_block = textwrap.dedent(DTYPE_MISMATCH_FIND).strip()
+        new_block = textwrap.dedent(DTYPE_MISMATCH_REPLACE).strip()
+        if not old_block or not new_block:
+            return source
+
+        first_line = old_block.split('\n')[0]
+        if not first_line:
+            return source
+
+        for line in source.split('\n'):
+            if first_line in line:
+                indent = line[:len(line) - len(line.lstrip())]
+                break
+        else:
+            return source
+
+        indented_old = textwrap.indent(old_block, indent)
+        indented_new = textwrap.indent(new_block, indent)
+
+        return source.replace(indented_old, indented_new)
+    except:
+        return source
+pass
 
 # Torch.compiling makes things slower - rather just leave it as addmm
 COMPILED_LORA_FORWARD = """
@@ -1240,15 +1469,16 @@ pass
 COMPILED_LORA_FORWARD_forced_float32 = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
+torch_float16 = torch.float16
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
-    xA = dropout(x.to(torch.float16)) @ lora_A.weight.to(torch.float16).t()
+    xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
     # output = result + scaling * xA @ lora_B.weight.t()
     shape = result.shape
     output = torch_addmm(
-        result.view(-1, shape[-1]),
+        result.view(-1, shape[-1]).to(torch_float16),
         xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(torch.float16).t(),
+        lora_B.weight.to(torch_float16).t(),
         alpha = scaling,
         beta = 1,
     ).view(shape)
@@ -1257,7 +1487,7 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     if bias is not None:
         output = torch_add(
         output,
-        bias.to(torch.float16),
+        bias.to(torch_float16),
         alpha = scaling,
     )
     return output
@@ -1429,13 +1659,13 @@ def patch_gradient_accumulation(modeling_file, module):
 
         total_has_kwargs = True
         print(f"Unsloth: Patching {inner_class.__name__} within {module.__name__} to fix gradient accumulation.")
-        regex_find = f"{call_class}\\(([^\\)]{{1,}}\\))"
+        regex_find = rf"{call_class}\(([^\)]{{1,}})\)"
         source = re.sub(regex_find, rf"{call_class}(\1, **kwargs)", source, flags = re.DOTALL | re.MULTILINE)
     pass
 
     if total_has_kwargs:
         # Fix **kwargs for function def
-        regex_find = "def forward\\(([^\\)]{1,})\\)"
+        regex_find = r"def forward\(([^\)]{1,})\)"
         source = re.sub(regex_find, r"def forward(\1, **kwargs)", source, flags = re.DOTALL | re.MULTILINE)
 
         # Remove double commas
@@ -1554,6 +1784,21 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
 pass
 
 
+def compile_causal_conv1d():
+    # For Liquid, Falcon and other Mamba type models
+    # We disable compiling on them!
+    try:
+        import causal_conv1d
+        causal_conv1d.causal_conv1d_fn     = \
+            torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
+        causal_conv1d.causal_conv1d_update = \
+            torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
+        return True
+    except:
+        return False
+pass
+
+
 # if module ends with any of these, disable compile
 DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
@@ -1605,8 +1850,10 @@ def unsloth_compile_transformers(
     modeling_file = eval(model_location)
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
 
-    # Use transformers model_type logger to supress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
-    exec("model_logger.addFilter(HideLoggingMessage('`use_cache`'))", globals(), locals())
+    # Use transformers model_type logger to suppress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
+    exec("model_logger.addFilter(HideLoggingMessage('use_cache'))", globals(), locals())
+    # Use transformers model_type logger to suppress message: You have set `compile_config`, but we are unable to meet the criteria for compilation.
+    exec("model_logger.addFilter(HideLoggingMessage('compile_config'))", globals(), locals())
 
     # Instead of Inductor Compilation:
     try:
@@ -1636,7 +1883,7 @@ def unsloth_compile_transformers(
         "memory_planning"           : True,
         "coordinate_descent_tuning" : UNSLOTH_COMPILE_MAXIMUM,
         "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
-        "compile_threads"           : 24,
+        # "compile_threads"           : 24, # Auto detects via https://github.com/unslothai/unsloth-zoo/pull/187
         "combo_kernels"             : False, # Causes incompatible gradient sizes on 2.6
         "group_fusion"              : True,
         "disable_progress"          : not UNSLOTH_ENABLE_LOGGING,
@@ -1649,6 +1896,9 @@ def unsloth_compile_transformers(
 
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
+
+    # Disable compiling mamba type models
+    has_causal_conv1d = compile_causal_conv1d()
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
@@ -1680,11 +1930,23 @@ def unsloth_compile_transformers(
     functions = list(np.array(functions)[np.argsort([full_source.find(x) for x in functions])])
     ordered_functions = functions.copy()
 
+    # If mamba type, but no fast causal functions, warn!
+    if not has_causal_conv1d and \
+        ("causal_conv1d_fn" in full_source or "causal_conv1d_update" in full_source):
+
+        print(
+            "**********\n"\
+            "Unsloth: Please install `causal_conv1d` to speed up Mamba training via `pip install causal_conv1d`\n"\
+            "If you don't, training will still work, just might be slower for Mamba type models.\n"\
+            "**********\n"
+        )
+    pass
+
     # Get class LlamaAttention(nn.Module)
     torch_modules = re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)
     # Also get class LlamaSdpaAttention(LlamaAttention)
     inherited_class = "(?:" + "|".join(re.findall(r"class ([^\s]{1,})\(.+?\.Module\)", full_source)) + ")"
-    inherited_modules = re.findall(r"class ([^\s]{1,})\\(" + inherited_class + r"\\)", full_source)
+    inherited_modules = re.findall(r"class ([^\s]{1,})\(" + inherited_class + r"\)", full_source)
     # OrderedSet
     torch_modules = list(dict.fromkeys(torch_modules + inherited_modules))
     # Get all functions as well
@@ -1709,7 +1971,7 @@ def unsloth_compile_transformers(
         except: continue
         if "_gradient_checkpointing_func" in source:
             gradient_checkpointed_modules.append(module)
-        elif "scaled_dot_product_attention" in source:
+        elif "scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source:
             scaled_dot_product_attention_modules.append(module)
         elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
             full_attention_modules.append(module)
@@ -1738,7 +2000,7 @@ def unsloth_compile_transformers(
         # Start of text
         defined = re.findall(r"\bdef[\s]{1,}" + re.escape(function),full_source, flags = re.DOTALL)
         # Disable self.
-        called = re.findall(r"[\s]{1,}" + re.escape(function) + r"\\(.+?\\)", full_source, flags = re.DOTALL)
+        called = re.findall(r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags = re.DOTALL)
         if len(defined) != 0 and len(called) != 0:
             called_functions.append(function)
     pass
@@ -2076,6 +2338,32 @@ def unsloth_compile_transformers(
         pass
     pass
 
+    # torch.finfo fix for transformers > 4.52.4 affect qwen2vl, qwen25vl, and glm4vl
+    for module in other_classes:
+        if module in all_standalone_classes:
+            source = all_standalone_classes[module]
+        else:
+            module_cls = eval(f"{model_location}.{module}")
+            if hasattr(module_cls, "forward"):
+                source = inspect.getsource(module_cls.forward)
+            else:
+                continue
+            new_source = patch_finfo_attention_mask_dtype_mismatch(module, source)
+            if new_source != source:
+                new_module = create_standalone_class(
+                    module,
+                    model_location,
+                    functions,
+                    fullgraph = False,
+                    disable = True,
+                    forward_source = new_source,
+                )
+                all_standalone_classes[module] = new_module
+                print(f"Unsloth: Patched {module} by fixing finfo dtype mismatch in attention mask")
+            pass
+        pass
+    pass
+
     # Manually replace hand written parts
     if manual_replacements:
         for module in compiler_replacements:
@@ -2159,6 +2447,7 @@ def unsloth_compile_transformers(
 
     # All other functions
     if compile_function_calls:
+        mask_functions = get_mask_functions()
         # Fix up function signatures
         for module in called_functions:
             function = eval(f"{model_location}.{module}")
@@ -2216,7 +2505,16 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(f"Unsloth: Cannot compile function {module} since disabled keyword is in it.")
-            all_standalone_classes[module] = source
+            # Skip mask creation functions
+            bad = False
+            for mask_function in mask_functions:
+                if mask_function == module:
+                    bad = True
+                    print(f"Unsloth: Will skip copying source of {module}.")
+                    break
+            pass
+            if not bad:
+                all_standalone_classes[module] = source
         pass
     pass
 
