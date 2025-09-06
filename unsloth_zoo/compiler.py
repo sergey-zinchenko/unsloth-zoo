@@ -42,6 +42,7 @@ from .utils import (
     is_distributed,
     distributed_function,
 )
+from .log import logger
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
@@ -50,13 +51,19 @@ from packaging.version import Version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
+from .temporary_patches.common import get_torch_compile_options
 
 # Compiled cache location
 global COMBINED_UNSLOTH_NAME
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
 
 global UNSLOTH_COMPILE_LOCATION
-UNSLOTH_COMPILE_LOCATION = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+if 'UNSLOTH_COMPILE_LOCATION' not in globals():
+    _loc = os.getenv("UNSLOTH_COMPILE_LOCATION", None)
+    if _loc:
+        UNSLOTH_COMPILE_LOCATION = _loc
+    else:
+        UNSLOTH_COMPILE_LOCATION = "unsloth_compiled_cache"
 
 global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = os.environ.get("UNSLOTH_COMPILE_USE_TEMP", "0") == "1"
@@ -97,6 +104,10 @@ DISABLED_KEYWORDS = [
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", # Gemma3 create_masks_for_generate
     "create_causal_mask(**mask_kwargs)", # Gemma3 create_masks_for_generate
     "compute_mup_vector", # used in falcon h1 init and not needed to compile + inductor complains
+    "segment_sum", # falcon h1
+    "apply_mask_to_padding_states", # falcon h1
+    "reshape_into_chunks", # falcon h1
+    "pad_tensor_by_size", # falcon h1
 ]
 
 _license_header = """
@@ -128,6 +139,8 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import math
 
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+UNSLOTH_ENABLE_CCE = os.environ.get("UNSLOTH_ENABLE_CCE", "1") == "1"
+UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
 
 import logging
 logger_compiler = logging.getLogger(__name__)
@@ -137,17 +150,21 @@ if UNSLOTH_ENABLE_LOGGING:
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
 
-import torch._dynamo.eval_frame as torch_dynamo_eval_frame
-torch_compiler_set_stance = torch.compiler.set_stance
-
+try:
+    import torch._dynamo.eval_frame as torch_dynamo_eval_frame
+    torch_dynamo_eval_frame._stance.stance
+    torch_compiler_set_stance = torch.compiler.set_stance
+except:
+    torch_dynamo_eval_frame = None
+    torch_compiler_set_stance = None
+pass
 """
 
 _disabled_sdpa_code = f"""{_license_header}
 
 from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
-    unsloth_compiled_ce_loss_function,
-    unsloth_compiled_fused_ce_loss_function,
+    unsloth_fused_ce_loss,
 )
 
 if UNSLOTH_STUDIO_ENABLED:
@@ -224,6 +241,8 @@ def get_transformers_model_type(
     model_types = [x.replace("-", "_").lower() for x in model_types]
     # Add splitted modules for eg gemma3_text -> gemma3
     model_types += [x.split("_")[0] for x in model_types]
+    if 'gpt-oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""):
+        model_types = [x for x in model_types if x != "gpt"]
     model_types = list(dict().fromkeys(model_types))
 
     from transformers import models
@@ -299,7 +318,7 @@ def _get_compile_folder(use_tempfile = False):
         UNSLOTH_COMPILE_USE_TEMP = True
         location = os.path.join(tempfile.gettempdir(), UNSLOTH_COMPILE_LOCATION)
         if not os.path.exists(location):
-            print(
+            logger.info(
                 f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
             )
             os.makedirs(location, exist_ok = True)
@@ -314,7 +333,7 @@ def _get_compile_folder(use_tempfile = False):
             UNSLOTH_COMPILE_USE_TEMP = True
             location = os.path.join(tempfile.gettempdir(), location)
             os.makedirs(location, exist_ok = True)
-            print(
+            logger.info(
                 f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
             )
     return location, UNSLOTH_COMPILE_USE_TEMP
@@ -336,6 +355,81 @@ def get_mask_functions():
         return []
 pass
 
+# Convert F.softmax(x, ...) to F.softmax(x, ..., dtype = torch.float32).to(x.dtype)
+def higher_precision_softmax(source):
+    """
+    Converts all softmax to float32 for eg:
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+    """
+    softmax_objects = re.finditer(
+        r"(nn\.functional\.softmax|F\.softmax)"\
+        r"\("\
+        r"([^,]{1,}), "\
+        r"(dim[ ]?\=[ ]?[\-0-9]{1,2})"\
+        r"(\,[ ]?dtype[^\)]{1,})?"\
+        r"\)",
+        source,
+    )
+    for item in softmax_objects:
+        full_match, matches = item.group(0), item.groups()
+        softmax, variable, dim, dtype = matches
+        new = f"{softmax}({variable}, {dim}, dtype = torch.float32).to({variable}.dtype)"
+        source = source.replace(full_match, new)
+    return source
+pass
+
+
+# Use float32 for layernorms if we find evidence for it
+def higher_precision_layernorms(modeling_file):
+    norm_modules = list(re.finditer(
+        r"\nclass[^\(\n]{1,}Norm\(nn\.Module\)"\
+        r".+?def __init__"\
+        r".+?self.weight"\
+        r".+?\nclass[^\(\n]{1,}",
+        modeling_file,
+        flags = re.DOTALL | re.MULTILINE,
+    ))
+    if len(norm_modules) == 0: return modeling_file
+    norm_module = norm_modules[0]
+    start, end = norm_module.span(0)
+    end = modeling_file.find("\nclass", end)
+    norm_module = modeling_file[start : end]
+    dtype = torch.float16
+    if "self.weight.to(torch.float32)" in norm_module:
+        dtype = torch.float32
+    elif "(self.weight * hidden_states).to(" in norm_module:
+        dtype = torch.float32
+    elif "self.weight * hidden_states.to(" in norm_module:
+        dtype = torch.float16
+    elif "self.weight.float()" in norm_module:
+        dtype = torch.float32
+    elif "return output * self.weight" in norm_module:
+        dtype = torch.float16
+    else:
+        dtype = torch.float16
+
+    # Set environment variable
+    higher_precision = os.environ.get("UNSLOTH_HIGH_PRECISION_LAYERNORM", "0") == "1"
+    if dtype == torch.float32:
+        higher_precision = True
+    if higher_precision:
+        print("Unsloth: Upcasting layernorm weights to float32")
+    os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "1" if higher_precision else "0"
+pass
+
+
+disble_use_cache_logging = """
+if hasattr(logger, "addFilter"):
+    import logging
+    class HideLoggingMessage(logging.Filter):
+        def __init__(self, text): self.text = text
+        def filter(self, x): return not (self.text in x.getMessage())
+    pass
+    logger.addFilter(HideLoggingMessage("`use_cache=True`"))
+"""
+
 def create_new_function(
     name,
     new_source,
@@ -349,6 +443,9 @@ def create_new_function(
     # All Unsloth Zoo code licensed under LGPLv3
     old_new_source = new_source
     do_logging = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+
+    # Fix all softmax low precisions to float32
+    new_source = higher_precision_softmax(new_source)
 
     if new_source[0] == " ":
         spaces = new_source.find("def")
@@ -379,6 +476,9 @@ def create_new_function(
     imports += "from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable\n"
     imports += f"from {model_location} import (" + ", ".join(x for x in items) + ")" if len(items) != 0 else ""
     new_source = imports + "\n\n" + new_source
+    # Check logger and remove use_cache
+    if "logger" in items:
+        new_source = new_source + "\n" + disble_use_cache_logging + "\n"
     new_source = prepend + new_source + append
 
     # Check versioning
@@ -409,7 +509,7 @@ def create_new_function(
     if not overwrite and os.path.isfile(function_location):
 
         # Check if exactly equivalent
-        with open(function_location, "r", encoding="utf-8") as f:
+        with open(function_location, "r", encoding = "utf-8") as f:
             file_source = f.read()
 
         if file_source != write_new_source:
@@ -476,13 +576,13 @@ def create_new_function(
             function_location = os.path.join(compile_folder, f"{name}.py")
             distributed_function(1, write_file, function_location, write_new_source)
             if is_main_process():
-                print(f"Standard import failed for {name}: {e}. Using tempfile instead!")
+                logger.info(f"Standard import failed for {name}: {e}. Using tempfile instead!")
             try:
                 new_module, old_path = import_module(compile_folder, name)
             except Exception as e:
                 new_module = None
                 if is_main_process():
-                    print(f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!")
+                    logger.info(f"Standard import failed for {name}: {e}. Using spec.loader.exec_module instead!")
         pass
         # Fallback to direct module loading
         if new_module is None:
@@ -590,6 +690,7 @@ def create_standalone_class(
 
     # Remove @auto_docstring
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{1,}\))?", "", source)
+    source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{1,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
 
     # Fix Gemma 3 ignore_index being not set!
@@ -602,6 +703,10 @@ def create_standalone_class(
         r"self.\1((input_ids \2 \3).clamp_(0))",
         source,
     )
+
+    # Fix all softmax low precisions to float32
+    source = higher_precision_softmax(source)
+
     return source
 pass
 
@@ -669,8 +774,11 @@ __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
-    old_stance = torch_dynamo_eval_frame._stance.stance
-    if INFERENCE_RUNS == 1:
+    if torch_dynamo_eval_frame is not None:
+        old_stance = torch_dynamo_eval_frame._stance.stance
+    else:
+        old_stance = None
+    if old_stance is not None and INFERENCE_RUNS == 1:
         # Skip guards and return to eager -> we still need guards!
         torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
         if UNSLOTH_ENABLE_LOGGING:
@@ -744,17 +852,7 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
-elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None and not requires_grad_):
-    loss = fast_linear_cross_entropy(
-        hidden_states        = hidden_states\\1,
-        lm_head              = self.lm_head,
-        labels               = labels,
-        num_items_in_batch   = n_items,
-        logit_softcapping    = None if (\\4) == () else (\\4),
-        logit_scale_multiply = None if (\\2) == () else (\\2),
-        logit_scale_divide   = None if (\\3) == () else (\\3),
-    )
-elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -770,52 +868,21 @@ else:
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = unsloth_compiled_fused_ce_loss_function(
+    loss = unsloth_fused_ce_loss(
+        trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        output_labels        = labels,
+        labels               = labels,
+        mask                 = None,
+        n_items              = n_items,
+        scaling              = getattr(self, "accelerator_scaler", None),
+        target_gb            = None,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
-        vocab_size           = (\\6),
-        n_items              = n_items if n_items is not None else 0,
-        requires_grad_       = requires_grad_,
     )
-
-    # ========= OLD non fused =========
-    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
-    # torch._dynamo.mark_dynamic(logits, 1)
-    # torch._dynamo.mark_dynamic(labels, 1)
-    # loss = unsloth_compiled_ce_loss_function(
-    #     output_logits        = logits,
-    #     output_labels        = labels,
-    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
-    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
-    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-    #     vocab_size           = (\\6),
-    #     n_items              = n_items if n_items is not None else 0,
-    #     requires_grad_       = requires_grad_,
-    # )
-
-
-    # if (\\2) != ():
-    #     logits = logits * (\\2)
-    # if (\\3) != ():
-    #     logits = logits / (\\3)
-    # if (\\4) != ():
-    #     logits = logits / (\\4)
-    #     logits = torch.tanh(logits)
-    #     logits = logits * (\\4)
-    # shift_logits = logits[..., :-1, :].float().contiguous()
-    # shift_labels = labels[..., 1:].contiguous()
-    # reduction = 'mean' if n_items is None else 'sum'
-    # loss_fct = torch.nn.CrossEntropyLoss(reduction = reduction)
-    # shift_logits = shift_logits.view(-1, \\6)
-    # shift_labels = shift_labels.view(-1)
-    # shift_labels = shift_labels.to(shift_logits.device)
-    # loss = loss_fct(shift_logits, shift_labels)
-    # if n_items is not None: loss = loss / n_items
 """.replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_2 = """
@@ -860,17 +927,7 @@ if RETURN_HIDDEN_STATES:
 elif labels is None:
     __DYNAMO__RECOMPILING__
     logits = self.lm_head(hidden_states\\1)
-elif (UNSLOTH_STUDIO_ENABLED and NOT_RETURN_LOGITS and labels is not None) and not requires_grad_:
-    loss = fast_linear_cross_entropy(
-        hidden_states        = hidden_states\\1,
-        lm_head              = self.lm_head,
-        labels               = labels,
-        num_items_in_batch   = n_items,
-        logit_softcapping    = None if (\\4) == () else (\\4),
-        logit_scale_multiply = None if (\\2) == () else (\\2),
-        logit_scale_divide   = None if (\\3) == () else (\\3),
-    )
-elif ((\\2) == () and (\\3) == ()) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -886,34 +943,21 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
-    loss = unsloth_compiled_fused_ce_loss_function(
+    loss = unsloth_fused_ce_loss(
+        trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        output_labels        = labels,
+        labels               = labels,
+        mask                 = None,
+        n_items              = n_items,
+        scaling              = getattr(self, "accelerator_scaler", None),
+        target_gb            = None,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
-        logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-        vocab_size           = (\\8),
-        n_items              = n_items if n_items is not None else 0,
-        requires_grad_       = requires_grad_,
+        logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-
-
-    # ========= OLD non fused =========
-    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
-    # torch._dynamo.mark_dynamic(logits, 1)
-    # torch._dynamo.mark_dynamic(labels, 1)
-    # loss = unsloth_compiled_ce_loss_function(
-    #     output_logits        = logits,
-    #     output_labels        = labels,
-    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
-    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
-    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-    #     vocab_size           = (\\8),
-    #     n_items              = n_items if n_items is not None else 0,
-    #     requires_grad_       = requires_grad_,
-    # )
 else:
     logits = self.lm_head(hidden_states\\1)
     if (\\2) != ():
@@ -986,37 +1030,21 @@ else:
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
-    loss = unsloth_compiled_fused_ce_loss_function(
+    loss = unsloth_fused_ce_loss(
+        trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        output_labels        = labels,
+        labels               = labels,
+        mask                 = \\6,
+        n_items              = n_items,
+        scaling              = getattr(self, "accelerator_scaler", None),
+        target_gb            = None,
+        torch_compile        = not UNSLOTH_COMPILE_DISABLE,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
-        logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-        vocab_size           = (\\7),
-        n_items              = n_items if n_items is not None else 0,
-        mask                 = \\6,
-        requires_grad_       = requires_grad_,
+        logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-
-    # ========= OLD non fused =========
-    # logits = self.lm_head(hidden_states\\1.to(lm_head_weight.device))
-    # torch._dynamo.mark_dynamic(logits, 1)
-    # torch._dynamo.mark_dynamic(labels, 1)
-    # if attention_mask is not None:
-    #     torch._dynamo.mark_dynamic(attention_mask, 1)
-    # loss = unsloth_compiled_ce_loss_function(
-    #     output_logits        = logits,
-    #     output_labels        = labels,
-    #     logit_scale_multiply = (\\2) if (\\2) != () else 0,
-    #     logit_scale_divide   = (\\3) if (\\3) != () else 0,
-    #     logit_softcapping    = (\\4) if (\\4) not in (None, (),) else 0,
-    #     vocab_size           = (\\7),
-    #     n_items              = n_items if n_items is not None else 0,
-    #     mask                 = \\6,
-    #     requires_grad_       = requires_grad_,
-    # )
 """.replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 ce_finders = [
@@ -1359,6 +1387,7 @@ def patch_gradient_checkpointing(module, source):
     try: forward = inspect.getsource(source.forward)
     except: return None
     if "_gradient_checkpointing_func" in forward: return None
+    if 'gpt-oss' in os.environ.get("UNSLOTH_MODEL_NAME", ""): return None
 
     # Fix Qwen2 missing None for gradient checkpointing
     for custom_find, custom_replace in custom_gradient_checkpointing_replacements:
@@ -1366,7 +1395,7 @@ def patch_gradient_checkpointing(module, source):
     pass
 
     # No gradient checkpointing?
-    modulelist_items = re.findall(r"(self\.[^ ]{1,}) = .*?nn\.ModuleList\(", init)
+    modulelist_items = re.findall(r"(self\.[^\s]{1,}) = .*?nn\.ModuleList\(", init)
     if len(modulelist_items) != 1: return None
     modulelist_item = modulelist_items[0]
 
@@ -1579,7 +1608,7 @@ def patch_lora_forwards(torch_compile_options):
     pass
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
-    
+
     if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
         print(could_not_replace_modules)
@@ -1783,8 +1812,7 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
     pass
 pass
 
-
-def compile_causal_conv1d():
+def compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING=False):
     # For Liquid, Falcon and other Mamba type models
     # We disable compiling on them!
     try:
@@ -1793,8 +1821,42 @@ def compile_causal_conv1d():
             torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
         causal_conv1d.causal_conv1d_update = \
             torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Disabled compiling causal_conv1d")
+        return True
+    except Exception as e:
+        print(e, str(e))
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling causal_conv1d")
+        return False
+pass
+
+def compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING=False):
+    # For Liquid, Falcon and other Mamba type models
+    # We disable compiling on them!
+    try:
+        import mamba_ssm
+        mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined        = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined,
+                recursive = True
+            )
+        mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined = \
+            torch.compiler.disable(
+            mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined,
+            recursive = True
+            )
+        mamba_ssm.ops.triton.selective_state_update.selective_state_update = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.selective_state_update.selective_state_update,
+                recursive = True
+            )
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Disabled compiling mamba_ssm")
         return True
     except:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling mamba_ssm")
         return False
 pass
 
@@ -1804,6 +1866,8 @@ DISABLE_COMPILE_MODULES = [
     "ParallelExperts",
     "GraniteMoeHybridMoE",
     "GraniteMoeHybridMambaLayer",
+    "GptOssMLP",
+    "GptOssExperts",
 ]
 
 
@@ -1851,7 +1915,7 @@ def unsloth_compile_transformers(
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"): return
 
     # Use transformers model_type logger to suppress message: Remove `use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`
-    exec("model_logger.addFilter(HideLoggingMessage('use_cache'))", globals(), locals())
+    exec("model_logger.addFilter(HideLoggingMessage('`use_cache`'))", globals(), locals())
     # Use transformers model_type logger to suppress message: You have set `compile_config`, but we are unable to meet the criteria for compilation.
     exec("model_logger.addFilter(HideLoggingMessage('compile_config'))", globals(), locals())
 
@@ -1872,33 +1936,27 @@ def unsloth_compile_transformers(
     UNSLOTH_COMPILE_MAXIMUM       = os.environ.get("UNSLOTH_COMPILE_MAXIMUM",       "0") == "1"
     UNSLOTH_COMPILE_IGNORE_ERRORS = os.environ.get("UNSLOTH_COMPILE_IGNORE_ERRORS", "0") == "1"
     UNSLOTH_ENABLE_LOGGING        = os.environ.get("UNSLOTH_ENABLE_LOGGING",        "0") == "1"
-    torch_compile_options = {
-        "epilogue_fusion"           : epilogue_fusion,
-        "max_autotune"              : max_autotune,
-        "shape_padding"             : shape_padding,
-        "trace.enabled"             : UNSLOTH_COMPILE_DEBUG or debug,
-        "triton.cudagraphs"         : cudagraphs,
-        "debug"                     : UNSLOTH_COMPILE_DEBUG or debug,
-        "dce"                       : True,
-        "memory_planning"           : True,
-        "coordinate_descent_tuning" : UNSLOTH_COMPILE_MAXIMUM,
-        "trace.graph_diagram"       : UNSLOTH_COMPILE_DEBUG or debug,
-        # "compile_threads"           : 24, # Auto detects via https://github.com/unslothai/unsloth-zoo/pull/187
-        "combo_kernels"             : False, # Causes incompatible gradient sizes on 2.6
-        "group_fusion"              : True,
-        "disable_progress"          : not UNSLOTH_ENABLE_LOGGING,
-        "verbose_progress"          : UNSLOTH_ENABLE_LOGGING,
-        "triton.multi_kernel"       : False, # Sometimes fails
-        "triton.use_block_ptr"      : False,
-        "triton.enable_persistent_tma_matmul" : True,
-        "triton.autotune_at_compile_time"     : True,
-    }
+    torch_compile_options = get_torch_compile_options(
+        epilogue_fusion = epilogue_fusion,
+        max_autotune = max_autotune,
+        shape_padding = shape_padding,
+        debug = UNSLOTH_COMPILE_DEBUG,
+        cudagraphs = cudagraphs,
+        coordinate_descent_tuning = UNSLOTH_COMPILE_MAXIMUM,
+        logging = UNSLOTH_ENABLE_LOGGING,
+        combo_kernels = False, # Causes incompatible gradient sizes on 2.6
+        group_fusion = True,
+        memory_planning = True,
+        multi_kernel = False, # Sometimes fails
+        use_block_ptr = False, # Sometimes fails
+    )
 
     # Compile timm models
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
 
     # Disable compiling mamba type models
-    has_causal_conv1d = compile_causal_conv1d()
+    has_causal_conv1d = compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING)
+    has_mamba_ssm = compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING)
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
@@ -1930,6 +1988,10 @@ def unsloth_compile_transformers(
     functions = list(np.array(functions)[np.argsort([full_source.find(x) for x in functions])])
     ordered_functions = functions.copy()
 
+    # Check layernorms for float32 / float16
+    # Sets UNSLOTH_HIGH_PRECISION_LAYERNORM
+    higher_precision_layernorms(full_source)
+
     # If mamba type, but no fast causal functions, warn!
     if not has_causal_conv1d and \
         ("causal_conv1d_fn" in full_source or "causal_conv1d_update" in full_source):
@@ -1937,6 +1999,17 @@ def unsloth_compile_transformers(
         print(
             "**********\n"\
             "Unsloth: Please install `causal_conv1d` to speed up Mamba training via `pip install causal_conv1d`\n"\
+            "If you don't, training will still work, just might be slower for Mamba type models.\n"\
+            "**********\n"
+        )
+    pass
+
+    # If mamba type, but no fast causal functions, warn!
+    if not has_mamba_ssm and \
+        ("mamba_chunk_scan_combined" in full_source or "mamba_split_conv1d_scan_combined" in full_source or "selective_state_update" in full_source):
+        print(
+            "**********\n"\
+            "Unsloth: Please install `mamba_ssm` to speed up Mamba training via `pip install mamba_ssm`\n"\
             "If you don't, training will still work, just might be slower for Mamba type models.\n"\
             "**********\n"
         )
@@ -1971,7 +2044,9 @@ def unsloth_compile_transformers(
         except: continue
         if "_gradient_checkpointing_func" in source:
             gradient_checkpointed_modules.append(module)
-        elif "scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source:
+        elif ("scaled_dot_product_attention" in source or "ALL_ATTENTION_FUNCTIONS" in source) \
+            and ("_supports_sdpa = False" not in full_source):
+            # Must add _supports_sdpa check since now all modules use ALL_ATTENTION_FUNCTIONS
             scaled_dot_product_attention_modules.append(module)
         elif "nn.functional.softmax" in source or "flash_attn_varlen_func" in source or "_flash_attention_forward" in source:
             full_attention_modules.append(module)
@@ -1986,9 +2061,9 @@ def unsloth_compile_transformers(
     # Check SDPA to load as eager or SDPA (Pixtral / Mistral 3 for eg doesn't have SDPA)
     if supports_sdpa is not None:
         assert(type(supports_sdpa) is list and len(supports_sdpa) == 1)
-        if len(scaled_dot_product_attention_modules) != 0:
+        if ("_supports_sdpa = True" in full_source) and ("_supports_sdpa = False" not in full_source):
             if supports_sdpa[0] != False: supports_sdpa[0] = True
-        elif "_supports_sdpa = True" in full_source:
+        elif len(scaled_dot_product_attention_modules) != 0:
             if supports_sdpa[0] != False: supports_sdpa[0] = True
         else:
             supports_sdpa[0] = False
@@ -1998,7 +2073,7 @@ def unsloth_compile_transformers(
     called_functions = []
     for function in functions:
         # Start of text
-        defined = re.findall(r"\bdef[\s]{1,}" + re.escape(function),full_source, flags = re.DOTALL)
+        defined = re.findall(r"\bdef[\s]{1,}" + re.escape(function), full_source, flags = re.DOTALL)
         # Disable self.
         called = re.findall(r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags = re.DOTALL)
         if len(defined) != 0 and len(called) != 0:
@@ -2553,6 +2628,9 @@ def unsloth_compile_transformers(
     except Exception as exception:
         if not disable:
             raise RuntimeError(exception)
+        if UNSLOTH_ENABLE_LOGGING:
+            print(str(exception))
+            print(str(dir(combined_module)))
         combined_module = None
 
     if compile_torch_modules and not disable:
@@ -2591,7 +2669,9 @@ def unsloth_compile_transformers(
         pass
     pass
     # Quick exit
-    if combined_module is None or disable: return
+    if combined_module is None or disable:
+        print(f"Unsloth: Exit auto compiler with combined_module = {combined_module}, disable = {disable}")
+        return
 
     # Import and replace with new module
     for module in all_standalone_classes.keys():

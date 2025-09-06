@@ -32,6 +32,7 @@ __all__ = [
     "MultiModalData",
     "ProcessingKwargs",
     "ProcessorMixin",
+    "_get_unique_storage_name",
 ]
 import inspect
 import typing as t
@@ -104,11 +105,24 @@ try:
     assert \
         type(Unpack) is type(t_Unpack), \
         "Unsloth: Unpack type changed! Please file a bug report asap!"
-except Exception as e:
+except ImportError as e:
+    e = str(e)
+    if "cannot import name '_center' from 'numpy._core.umath'" in e:
+        raise RuntimeError(
+            f"***** You might have used uv to install packages, and they broke numpy. Try restarting your runtime. *****"
+        )
+    elif "torchvision::nms does not exist" in e:
+        raise RuntimeError(
+            f"***** Please update and reinstall torchvision - it broke! `pip install --upgrade --force-reinstall --no-cache-dir torchvision` *****"
+        )
+    elif "Unpack" not in e:
+        raise Exception(e)
     raise RuntimeError(
         f"Unsloth: Unpack has been moved! Other error = {str(e)}.\n"\
         "Please file a bug report asap!"
     )
+except Exception as e:
+    raise Exception(e)
 pass
 KWARGS_TYPE = t_Unpack[t_TypedDictMeta]
 
@@ -143,7 +157,7 @@ try:
     assert \
         type(TransformersKwargs) is t_TypedDictMeta, \
         "Unsloth: TransformersKwargs type changed! Please file a bug report asap!"
-except Exception as e:
+except ImportError as e:
     from transformers import __version__ as transformers_version
     if Version(transformers_version) >= Version("4.54.0.dev0"):
         raise RuntimeError(
@@ -152,6 +166,8 @@ except Exception as e:
         )
     else:
         pass
+except Exception as e:
+    raise Exception(e)
 pass
 
 # Get FlashAttentionKwargs

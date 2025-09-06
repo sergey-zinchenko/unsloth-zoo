@@ -28,7 +28,8 @@ METRICS_MOVE_TO_END = [
 REMOVED_METRICS = [
     "num_tokens", # All extras - not necessary
     "mean_token_accuracy", # SFT extras
-
+    "entropy",
+    
     # GRPO extras
     "clip_ratio",
     'clip_ratio/low_mean',
@@ -168,7 +169,7 @@ def get_trl_metrics():
     for trainer in trainers:
         filename = os.path.join(filepath, f"{trainer}.py")
         if not os.path.exists(filename): continue
-        with open(filename, "r") as file: file = file.read()
+        with open(filename, "r", encoding = "utf-8") as file: file = file.read()
 
         # Get metrics['kl'] or stats['kl']
         metrics = re.findall(r"_?metrics\[[\"\']([^\"\']{1,})[\"\']\]", file)
