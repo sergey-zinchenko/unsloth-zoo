@@ -28,11 +28,23 @@ import torch
 import os
 import time
 import contextlib
+import re
+import pathlib
+from typing import Optional
+from filelock import FileLock
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        return TrueVersion(version)
+        version = str(version)
+        try:
+            return TrueVersion(version)
+        except Exception as e:
+            version = re.match(r"[0-9\.]{1,}", version)
+            if version is None:
+                raise Exception(str(e))
+            version = version.group(0).rstrip(".")
+            return TrueVersion(version)
     except:
         from inspect import getframeinfo, stack
         caller = getframeinfo(stack()[1][0])
@@ -57,9 +69,10 @@ def _get_dtype(dtype):
         return __DTYPE_MAP[dtype]
     except:
         if type(dtype) is str:
-            try: dtype = eval(f"torch.{dtype.lower()}")
-            except: pass
-        if type(dtype) is torch.dtype: return dtype
+            dtype = dtype.lower()
+            return getattr(torch, dtype, None)
+        elif isinstance(dtype, torch.dtype):
+            return dtype
     return None
 pass
 
@@ -124,6 +137,28 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
             return list(result)
         raise ValueError(f"[Non-distributed] Expected {n} elements, but got: {result}")
 pass
+
+def _lock_path_for(target: str) -> str:
+    """ str needs to be a valid file path """
+    locks_dir = pathlib.Path(target).parent / ".locks"
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    return str(locks_dir / f".lock.{pathlib.Path(target).name}")
+
+def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
+    """
+    Get a lock for a target file.
+    target: str, the path to the file to lock
+    timeout: int, the timeout in seconds for the lock
+    If timeout is not provided, it will use the value of
+    the environment variable UNSLOTH_LOCK_TIMEOUT, otherwise 10 seconds.
+
+    Returns:
+        FileLock, the lock for the target file
+    """
+    lock_path = _lock_path_for(target)
+    if timeout is None:
+        timeout = int(os.environ.get("UNSLOTH_LOCK_TIMEOUT", "10"))
+    return FileLock(lock_path, timeout=timeout)
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
